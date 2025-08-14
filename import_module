@@ -1,0 +1,404 @@
+import os
+import math
+import random
+import cv2
+import numpy as np
+import tensorflow as tf
+import tensorflow.keras.backend as K
+import pandas as pd
+from PyQt5.QtGui import QImage, QPixmap
+from datetime import datetime
+import matplotlib.pyplot as plt
+from matplotlib import gridspec
+
+class MyClock():
+    def init(self):
+        self.prevtime = datetime.now()
+    def tictoc(self):
+        self.nowtime = datetime.now()
+        print("Taken Time : %s" % (str(self.nowtime - self.prevtime)))
+        self.prevtime = datetime.now()
+
+def spin2rgb(X):
+    def normalize(v, axis=-1):
+        norm = np.linalg.norm(v, ord=2, axis=axis, keepdims=True)
+        return norm, np.nan_to_num(v / norm)
+    def hsv2rgb(hsv):
+        hsv = np.asarray(hsv)
+        if hsv.shape[-1] != 3: raise ValueError("Last dimension of input array must be 3; " "shape {shp} was found.".format(shp=hsv.shape))
+        in_shape = hsv.shape
+        hsv = np.array(hsv, copy=False, dtype=np.promote_types(hsv.dtype, np.float32), ndmin=2)
+
+        h, s, v = hsv[..., 0], hsv[..., 1], hsv[..., 2]
+        r, g, b = np.empty_like(h), np.empty_like(h), np.empty_like(h)
+
+        i = (h * 6.0).astype(int)
+        f = (h * 6.0) - i
+        p = v * (1.0 - s)
+        q = v * (1.0 - s * f)
+        t = v * (1.0 - s * (1.0 - f))
+
+        idx = i % 6 == 0
+        r[idx], g[idx], b[idx] = v[idx], t[idx], p[idx]
+
+        idx = i == 1
+        r[idx], g[idx], b[idx] = q[idx], v[idx], p[idx]
+
+        idx = i == 2
+        r[idx], g[idx], b[idx] = p[idx], v[idx], t[idx]
+
+        idx = i == 3
+        r[idx], g[idx], b[idx] = p[idx], q[idx], v[idx]
+
+        idx = i == 4
+        r[idx], g[idx], b[idx] = t[idx], p[idx], v[idx]
+
+        idx = i == 5
+        r[idx], g[idx], b[idx] = v[idx], p[idx], q[idx]
+
+        idx = s == 0
+        r[idx], g[idx], b[idx] = v[idx], v[idx], v[idx]
+
+        rgb = np.stack([r, g, b], axis=-1)
+        return rgb.reshape(in_shape)
+    norm, normed_X = normalize(X)
+    norm = np.clip(norm, 0, 1)
+    X = norm * normed_X
+    sxmap, symap, szmap = np.split(X, 3, axis=-1)
+    szmap = 0.5 * szmap + (norm / 2.)
+    H = np.clip(-np.arctan2(sxmap, -symap) / (2 * np.pi) + 0.5, 0, 1)
+    S = np.clip(2 * np.minimum(szmap, norm - szmap), 0, norm)
+    V = np.clip(2 * np.minimum(norm, szmap + norm / 2.) - 1.5 * norm + 0.5, 0.5 - 0.5 * norm, 0.5 + 0.5 * norm)
+    img = np.concatenate((H, S, V), axis=-1)
+    for i, map in enumerate(img): img[i] = hsv2rgb(map)
+    return img
+def ndarray2pixmap(npimg, dsize=(0, 0), fx=1, fy=1, interpolation="None", return_qimage=False):
+    if interpolation == "None":
+        itp = cv2.INTER_NEAREST
+    elif interpolation == "bicubic":
+        itp = cv2.INTER_CUBIC
+    npimg = cv2.resize(npimg, dsize=dsize, fx=fx, fy=fy, interpolation=itp)
+    npimg = np.clip(npimg, a_min=0., a_max=255.).astype(np.uint8)
+    qimage = QImage(npimg, npimg.shape[1], npimg.shape[0], QImage.Format_RGB888)
+    if return_qimage:
+        return qimage
+    else:
+        return QPixmap(qimage)
+def getCallBacks(save_path, save_best_only=True, save_weights_only=False):
+    return tf.keras.callbacks.ModelCheckpoint(save_path, save_best_only=save_best_only, save_weights_only=save_weights_only)
+def getEncoder(input_img, encoding_dim, channels, kernel_Size, activation, batchNorm_bl=False, periodic_BC=False):
+    padding = "valid" if periodic_BC else "same"
+    cnn_channels, dense_channels = channels
+    x = input_img
+    for i in range (len(cnn_channels)):
+        if periodic_BC: x = wrap_pad(x, kernel_Size//2, kernel_Size//2)
+
+        x = tf.keras.layers.Conv2D(cnn_channels[i], (kernel_Size, kernel_Size), activation=None, padding=padding, name="EncoderConv" + str(i))(x)
+
+        if batchNorm_bl: x = tf.keras.layers.BatchNormalization(name="EncoderBNConv" + str(i))(x)
+
+        x = tf.keras.layers.LeakyReLU(name="EncoderActConv" + str(i))(x) if activation == "leakyrelu" else tf.keras.layers.Activation(activation, name="EncoderActConv" + str(i))(x)
+        x = tf.keras.layers.MaxPooling2D((2, 2), name="EncoderMaxPool" + str(i))(x)
+    x = tf.keras.layers.Flatten(name="EncoderFlatten")(x)
+    for i in range(len(dense_channels)):
+        x = tf.keras.layers.Dense(dense_channels[i], activation=None, name="EncoderDense" + str(i))(x)
+        if batchNorm_bl: x = tf.keras.layers.BatchNormalization(name="EncoderBNDense" + str(i))(x)
+        x = tf.keras.layers.LeakyReLU(name="EncoderActDense" + str(i))(x) if activation == "leakyrelu" else tf.keras.layers.Activation(activation, name="EncoderActDense" + str(i))(x)
+    encoded = tf.keras.layers.Dense(encoding_dim + encoding_dim, activation=None, name="EncoderEnd")(x)
+    return encoded
+def getDecoder(z, dense_ouputimg_size, channels, kernel_Size, activation, batchNorm_bl=False, periodic_BC=False, last_Normalize=False):
+    padding = "valid" if periodic_BC else "same"
+    dense_channels, cnn_channels = channels
+    x = tf.keras.layers.Layer(name="DecoderStart")(z)
+    for i in range(len(dense_channels)):
+        x = tf.keras.layers.Dense(dense_channels[i], activation=None, name="DecoderDense" + str(i))(x)
+        if batchNorm_bl: x = tf.keras.layers.BatchNormalization(name="DecoderBNDense" + str(i))(x)
+        x = tf.keras.layers.LeakyReLU(name="DecoderActDense" + str(i))(x) if activation == "leakyrelu" else tf.keras.layers.Activation(activation, name="DecoderActDense" + str(i))(x)
+    x = tf.keras.layers.Dense(dense_ouputimg_size * dense_ouputimg_size * cnn_channels[0] * 2, activation=None, name="DecoderDenseLast")(x)
+    if batchNorm_bl: x = tf.keras.layers.BatchNormalization(name="DecoderBNDenseLast")(x)
+    x = tf.keras.layers.LeakyReLU(name="DecoderActDenseLast")(x) if activation == "leakyrelu" else tf.keras.layers.Activation(activation, name="DecoderActDenseLast")(x)
+    x = tf.keras.layers.Reshape((dense_ouputimg_size, dense_ouputimg_size, cnn_channels[0] * 2), name="DecoderReshape")(x)
+    for i in range (len(cnn_channels)):
+        x = tf.keras.layers.UpSampling2D((2, 2), interpolation="nearest", name="DecoderUpSampling" + str(i))(x)
+        if periodic_BC: x = wrap_pad(x, kernel_Size // 2, kernel_Size // 2)
+        x = tf.keras.layers.Conv2D(cnn_channels[i], (kernel_Size, kernel_Size), activation=None, padding=padding, name="DecoderConv" + str(i))(x)
+        if batchNorm_bl: x = tf.keras.layers.BatchNormalization(name="DecoderBNConv" + str(i))(x)
+        x = tf.keras.layers.LeakyReLU(name="DecoderActConv" + str(i))(x) if activation == "leakyrelu" else tf.keras.layers.Activation(activation, name="DecoderActConv" + str(i))(x)
+    if periodic_BC: x = wrap_pad(x, kernel_Size // 2, kernel_Size // 2)
+    x = tf.keras.layers.Conv2D(3, (kernel_Size, kernel_Size), activation=None, padding=padding, name="DecoderConvLast")(x)
+    x = tf.keras.layers.Layer(name="DecoderEnd")(x)
+    decoded = K.l2_normalize(x, axis=-1) if last_Normalize else x
+    return decoded
+def getEncoderFromLoadedModel(vae_model, img_size, periodic_BC):
+    input_img = tf.keras.layers.Input(shape=(img_size, img_size, 3))
+    vae_layers = vae_model.layers
+    for i in range(len(vae_layers)):
+        if vae_layers[i].name == "EncoderEnd":
+            encoder_end_index = i
+            break
+    x = input_img
+    for i in range(encoder_end_index+1):
+        if vae_layers[i].name[:7] == "Encoder":
+            if periodic_BC:
+                if vae_layers[i].name[7:7+4] == "Conv":
+                    kernel_Size = vae_layers[i].get_weights()[0].shape[0]
+                    x = wrap_pad(x, kernel_Size//2, kernel_Size//2)
+            x = vae_layers[i](x)
+    encoded = x
+    encoding_dim = encoded.shape[-1]//2
+    z_mean, z_log_var = encoded[:, :encoding_dim], encoded[:, encoding_dim:]
+    z = tf.keras.layers.Lambda(sampling, output_shape=(encoding_dim,), name='z_Sampling')([z_mean, z_log_var])
+    encoder_model = tf.keras.models.Model(input_img, [z_mean, z_log_var, z])
+    return encoder_model, encoding_dim
+def getDecoderFromLoadedModel(vae_model, code_dim, periodic_BC, last_Normalize):
+    input_code = tf.keras.layers.Input(shape=(code_dim))
+    vae_layers = vae_model.layers
+    for i in range(len(vae_layers)):
+        if vae_layers[i].name == "DecoderStart":
+            decoder_start_index = i
+        elif vae_layers[i].name == "DecoderEnd":
+            decoder_end_index = i
+            break
+    x = input_code
+    for i in range(decoder_start_index, decoder_end_index+1):
+        if vae_layers[i].name[:7] == "Decoder":
+            if periodic_BC:
+                if vae_layers[i].name[7:7+4] == "Conv":
+                    kernel_Size = vae_layers[i].get_weights()[0].shape[0]
+                    x = wrap_pad(x, kernel_Size//2, kernel_Size//2)
+            x = vae_layers[i](x)
+    decoded = K.l2_normalize(x, axis=-1) if last_Normalize else x
+    decoder_model = tf.keras.models.Model(input_code, decoded)
+    return decoder_model
+def getVAEModel(img_size, encoding_dim, encoder_channels, decoder_channels, activation,
+                kernel_Size=3, batchNorm_bl=False, periodic_BC=False, last_Normalize=False,
+                learning_rate = 1e-3, alpha=1., beta=0.0):
+    K.clear_session()
+    dense_ouputimg_size = img_size//(2**(len(decoder_channels[1])))
+
+    input_img = tf.keras.layers.Input(shape=(img_size, img_size, 3))
+
+
+    encoded = getEncoder(input_img, encoding_dim, encoder_channels, kernel_Size, activation, batchNorm_bl=batchNorm_bl, periodic_BC=periodic_BC)
+    z_mean, z_log_var = encoded[:, :encoding_dim], encoded[:, encoding_dim:]
+    z = tf.keras.layers.Lambda(sampling, output_shape=(encoding_dim,), name='z_Sampling')([z_mean, z_log_var])
+    decoded = getDecoder(z, dense_ouputimg_size, decoder_channels, kernel_Size, activation, batchNorm_bl=batchNorm_bl, periodic_BC=periodic_BC, last_Normalize=last_Normalize)
+    vae_model = tf.keras.models.Model(input_img, decoded, name='hgvae_model')
+
+    reconstruction_loss = K.mean(K.reshape(K.square(input_img-decoded), [tf.shape(input_img)[0], -1]), axis=-1)
+    kl_loss = 0.5 * K.sum(K.square(z_mean) + K.exp(z_log_var) - z_log_var - 1, axis=-1)
+    # mseE = K.square(energy_calculation([decoded, totalW3x3, hext])-energy_calculation([input_img, totalW3x3, hext]))
+    # hamiltonian_loss = mseE
+    vae_loss = K.mean(alpha * reconstruction_loss + beta * kl_loss)
+    vae_model.add_loss(vae_loss)
+    vae_model.add_metric(alpha * reconstruction_loss, name="alpha_rc", aggregation='mean')
+    vae_model.add_metric(beta * kl_loss, name="beta_kl", aggregation='mean')
+    vae_model.add_metric(K.abs(z_mean), name="abs_zmean", aggregation='mean')
+    vae_model.add_metric(K.exp(0.5*z_log_var), name="zstd", aggregation='mean')
+    opt = tf.keras.optimizers.Adam(learning_rate = learning_rate)
+    vae_model.compile(optimizer=opt)
+    return vae_model
+def sampling(args):
+    z_mean, z_log_var = args
+    batch = K.shape(z_mean)[0]
+    dim = K.int_shape(z_mean)[1]
+    epsilon = K.random_normal(shape=(batch, dim))
+    return z_mean + K.exp(0.5 * z_log_var) * epsilon
+def getW3x3(args):
+    exJ, DMN, self_bl = args
+    W3x3 = np.zeros([3, 3, 3, 3], dtype=np.float32)
+    for i in range(3):
+        for j in range(3):
+            if (i == 0 and j == 1):
+                W3x3[i, j, 0, 0] += exJ
+                W3x3[i, j, 1, 1] += exJ
+                W3x3[i, j, 2, 2] += exJ
+                W3x3[i, j, 2, 1] += -DMN
+                W3x3[i, j, 1, 2] += DMN
+            if (i == 2 and j == 1):
+                W3x3[i, j, 0, 0] += exJ
+                W3x3[i, j, 1, 1] += exJ
+                W3x3[i, j, 2, 2] += exJ
+                W3x3[i, j, 2, 1] += DMN
+                W3x3[i, j, 1, 2] += -DMN
+            if (i == 1 and j == 0):
+                W3x3[i, j, 0, 0] += exJ
+                W3x3[i, j, 1, 1] += exJ
+                W3x3[i, j, 2, 2] += exJ
+                W3x3[i, j, 2, 0] += DMN
+                W3x3[i, j, 0, 2] += -DMN
+            if (i == 1 and j == 2):
+                W3x3[i, j, 0, 0] += exJ
+                W3x3[i, j, 1, 1] += exJ
+                W3x3[i, j, 2, 2] += exJ
+                W3x3[i, j, 2, 0] += -DMN
+                W3x3[i, j, 0, 2] += DMN
+            if (i == 1 and j == 1):
+                if self_bl:
+                    W3x3[i, j, 0, 0] += -4*exJ
+                    W3x3[i, j, 1, 1] += -4*exJ
+                    W3x3[i, j, 2, 2] += -4*exJ
+    return W3x3
+def getextField(args):
+    i_size, j_size, hextz = args
+    tf_extH = tf.ones([1, i_size, j_size, 3], dtype=tf.float32)
+    tf_extH *= np.array([0., 0., hextz])
+    return tf_extH
+def energy_calculation(args):
+    tfX, totalW3x3, hext = args
+    def getHeff(X, filter, strides=[1, 1, 1, 1], padding="VALID"):
+        return tf.nn.conv2d(input=X, filters=filter, strides=strides, padding=padding)
+    padded_input = wrap_pad(tfX, 1, 1)
+    totalHeff3x3 = getHeff(padded_input, totalW3x3)
+    return K.mean(tf.reshape(-tf.reduce_sum(tf.multiply(tfX, hext + totalHeff3x3 / 2.), axis=-1), [tf.shape(tfX)[0], -1]), axis=-1)
+def wrap_pad(tfX, padi, padj, boundary="Periodic"):
+    if boundary == "Periodic":
+        M1 = tf.concat([tfX[:, :, -padj:, :], tfX, tfX[:, :, 0:padj, :]], 2)
+        M1 = tf.concat([M1[:, -padi:, :, :], M1, M1[:, 0:padi, :, :]], 1)
+    elif boundary == "Not Periodic":
+        M1 = tf.concat(
+            [tf.zeros_like(tfX[:, :, -padj:, :]), tfX, tf.zeros_like(tfX[:, :, 0:padj, :])], 2)
+        M1 = tf.concat([tf.zeros_like(M1[:, -padi:, :, :]), M1, tf.zeros_like(M1[:, 0:padi, :, :])], 1)
+    elif boundary == "X Periodic":
+        M1 = tf.concat([tfX[:, :, -padj:, :], tfX, tfX[:, :, 0:padj, :]], 2)
+        M1 = tf.concat([tf.zeros_like(M1[:, -padi:, :, :]), M1, tf.zeros_like(M1[:, 0:padi, :, :])], 1)
+    elif boundary == "Y Periodic":
+        M1 = tf.concat(
+            [tf.zeros_like(tfX[:, :, -padj:, :]), tfX, tf.zeros_like(tfX[:, :, 0:padj, :])], 2)
+        M1 = tf.concat([M1[:, -padi:, :, :], M1, M1[:, 0:padi, :, :]], 1)
+    return M1
+def getIC(paramdict, batch_size=1):
+    i_size, j_size = paramdict["SizeY"], paramdict["SizeX"]
+    initcond, inittheta, initphi = paramdict["initcond"], paramdict["inittheta"], paramdict["initphi"]
+    def randIC(i_size, j_size, batch_size):
+        X = np.zeros([batch_size, i_size, j_size, 3])
+        for i in range(i_size):
+            for j in range(j_size):
+                for b in range(batch_size):
+                    costheta = np.random.uniform(-1., 1.)
+                    theta = np.arccos(costheta)
+                    phi = random.random() * math.pi * 2
+                    X[b, i, j, 0] = math.sin(theta) * math.cos(phi)
+                    X[b, i, j, 1] = math.sin(theta) * math.sin(phi)
+                    X[b, i, j, 2] = math.cos(theta)
+        return X
+    def unifIC(i_size, j_size, inittheta, initphi, batch_size):
+        X = np.zeros([batch_size, i_size, j_size, 3])
+        for i in range(i_size):
+            for j in range(j_size):
+                for b in range(batch_size):
+                    theta = np.pi * inittheta / 180
+                    phi = np.pi * initphi / 180
+                    X[b, i, j, 0] = math.sin(theta) * math.cos(phi)
+                    X[b, i, j, 1] = math.sin(theta) * math.sin(phi)
+                    X[b, i, j, 2] = math.cos(theta)
+        return X
+    if initcond == "Random": X = randIC(i_size, j_size, batch_size)
+    elif initcond == "Uniform": X = unifIC(i_size, j_size, inittheta, initphi, batch_size)
+    return X
+def MCCanonical(T, totalHeff):
+    totalHeff = tf.cast(totalHeff, tf.float64)
+    xfact, yfact, zfact = tf.split(tf.nn.l2_normalize(totalHeff, axis=-1), num_or_size_splits=3, axis=-1)
+    rfact = tf.norm(totalHeff, axis=-1, keepdims=True)
+    rhofact = tf.sqrt(tf.pow(xfact, 2) + tf.pow(yfact, 2))
+    R = tf.random.uniform(tf.shape(rfact), 0, 1, dtype=tf.float64)
+    phiR = tf.random.uniform(tf.shape(rfact), 0, 2 * np.pi, dtype=tf.float64)
+
+    beta = rfact / T
+    expbeta = tf.exp(beta)
+    mexpbeta = tf.exp(-beta)
+    szphightemp = tf.math.divide(tf.math.log(tf.add(tf.multiply(R, tf.subtract(expbeta, mexpbeta)), mexpbeta)), beta)
+    szplowtemp = 1. + tf.math.log(1. - R) / beta
+    szp = tf.where(tf.math.is_finite(expbeta), szphightemp, szplowtemp)
+    srho = tf.sqrt(1 - tf.pow(szp, 2))
+    sxp = tf.multiply(srho, tf.cos(phiR))
+    syp = tf.multiply(srho, tf.sin(phiR))
+
+    szz = tf.where(tf.not_equal(rhofact, 0), tf.multiply(szp, zfact) - tf.multiply(sxp, rhofact), tf.multiply(szp, zfact))
+    sxx = tf.where(tf.not_equal(rhofact, 0), szp * xfact + sxp * zfact * xfact / rhofact - syp * yfact / rhofact, sxp)
+    syy = tf.where(tf.not_equal(rhofact, 0), szp * yfact + sxp * zfact * yfact / rhofact + syp * xfact / rhofact, syp)
+
+    nextinput = tf.cast(tf.nn.l2_normalize(tf.concat([sxx, syy, szz], axis=-1), axis=-1), tf.float32)
+    return nextinput
+def getTfeed(it, paramdict):
+    if it < paramdict["Tcooling_end"] * paramdict["Total_Iteration"]:
+        Tfeed = paramdict["Tstart"] - (paramdict["Tstart"] - paramdict["Tend"]) * (
+                    it / (paramdict["Tcooling_end"] * paramdict["Total_Iteration"]))
+    else:
+        Tfeed = paramdict["Tend"]
+    return Tfeed
+def mkdir(*args):
+    for arg in args:
+        if not os.path.exists(arg) == True:
+            os.makedirs(arg)
+def load_modelconfig(load_path):
+    try:
+        modelconfig_txt = open(os.path.join(load_path, "model_config.txt"), "r")
+        modelconfig = modelconfig_txt.readline().split(", ")
+        modelconfig_txt.close()
+        periodic_BC = modelconfig[0].split("= ")[1] == "True"
+        last_Normalize = modelconfig[1].split("= ")[1] == "True"
+    except:
+        periodic_BC, last_Normalize = False, False
+    return periodic_BC, last_Normalize
+def get_best_model_path(load_path, mode="MaxEp"):
+    listdir_parent_dir = os.listdir(load_path)
+    index_files = [name for name in listdir_parent_dir if name[-len(".index"):] == ".index"]
+
+    if mode == "MaxEp":
+        index, max_epoch = 0, 0
+        for i, name in enumerate(index_files):
+            epoch = int(name.split("-")[0][len("Epoch"):])
+            if max_epoch < epoch:
+                max_epoch = epoch
+                index = i
+    elif mode == "MinValLoss":
+        index, min_valloss = 0, 100
+        for i, name in enumerate(index_files):
+            valloss = float(name.split("_")[1][len("ValLoss"):-len(".index")])
+            if min_valloss > valloss:
+                min_valloss = valloss
+                index = i
+    return os.path.join(load_path, index_files[index])
+def colorimgGridPlot(X, gridx, gridy, figsizex=10, figsizey=10, interpolation="None"):
+    fig = plt.figure(figsize=(figsizex, figsizey))
+    gs = gridspec.GridSpec(gridx, gridy)
+    gs.update(wspace=0.05, hspace=0.05)
+    rgbs = spin2rgb(X)
+    for i, rgb in enumerate(rgbs):
+        ax = plt.subplot(gs[i])
+        plt.axis('off')
+        ax.set_xticklabels([])
+        ax.set_yticklabels([])
+        ax.set_aspect('equal')
+        ax.imshow(rgb, interpolation=interpolation)
+    plt.show()
+    plt.close(fig)
+
+def normalization(spinmap_n_n_3):
+    norm_map = np.linalg.norm(spinmap_n_n_3, ord=2, axis=-1, keepdims=True)
+    mean_norm = np.mean(norm_map)
+    norm_spinmap = spinmap_n_n_3/norm_map
+
+    return norm_spinmap, mean_norm, norm_map
+def spinMapExcelSave(save_path, spin_map_n_n_3):
+    spin_map_n_n_3 = np.squeeze(spin_map_n_n_3)
+    path = save_path + "_snap"
+    excelwriter = pd.ExcelWriter(path + ".xlsx")
+    sx = pd.DataFrame(spin_map_n_n_3[:, :, 0])
+    sx.to_excel(excelwriter, "Sx")
+    sy = pd.DataFrame(spin_map_n_n_3[:, :, 1])
+    sy.to_excel(excelwriter, "Sy")
+    sz = pd.DataFrame(spin_map_n_n_3[:, :, 2])
+    sz.to_excel(excelwriter, "Sz")
+    excelwriter.save()
+    excelwriter.close()
+
+def spinMapLoad(load_path):
+    pd_Sx = pd.read_excel(load_path, sheet_name="Sx", dtype=np.float32, index_col=0)
+    pd_Sy = pd.read_excel(load_path, sheet_name="Sy", dtype=np.float32, index_col=0)
+    pd_Sz = pd.read_excel(load_path, sheet_name="Sz", dtype=np.float32, index_col=0)
+    avgX = np.expand_dims(np.stack([pd_Sx.values, pd_Sy.values, pd_Sz.values], axis=2), axis=0)
+    # X,_ = normalization(avgX)
+    # X = X
+    return avgX #x
