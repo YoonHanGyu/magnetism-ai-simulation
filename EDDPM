@@ -1,0 +1,859 @@
+import numpy as np
+import tensorflow as tf
+import tensorflow.keras.backend as K
+from sklearn.datasets import make_checkerboard, make_circles, make_moons, make_s_curve, make_swiss_roll
+import matplotlib.pyplot as plt
+import pandas as pd
+import os
+import time
+from topological_charge_module import *
+from PIL import Image
+from scipy import ndimage
+import cv2
+import glob
+
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+for gpu in tf.config.experimental.list_physical_devices('GPU'):
+    tf.compat.v2.config.experimental.set_memory_growth(gpu, True)
+
+"""Hyperparameters"""
+
+learning_rate = 1e-4
+base_filters = 16
+time_embedding_dim = 128
+num_diffusion_steps = 1000
+batch_size = 32
+num_epochs = 100
+betastart = 1e-4
+betaend = 0.02
+schedule = "linear"
+
+"""Dataload"""
+current_dir = os.getcwd()
+load_dir = os.path.join(current_dir, "heat_bath_labyrinth_128by128_DM0.3_T0.0_30000samples_10000itr_23_0717")
+filepath = os.path.join(load_dir, "Total30000samples_DMN0.30.npy")
+dataset = np.load(filepath)
+data_len = np.shape(dataset)[0]
+
+train_dataset = tf.data.Dataset.from_tensor_slices(dataset[:int(data_len * 0.9), :, :, :])
+# train_dataset = tf.data.Dataset.from_tensor_slices(dataset[:16*100, :, :, :])
+
+
+# train_dataset = train_dataset.shuffle(buffer_size=data_len).batch(batch_size)
+train_dataset = train_dataset.batch(batch_size)
+
+test_dataset = tf.data.Dataset.from_tensor_slices(dataset[int(data_len * 0.9):, :, :, :])
+# test_dataset = tf.data.Dataset.from_tensor_slices(dataset[16*100:16*200, :, :, :])
+
+# test_dataset = test_dataset.shuffle(buffer_size=data_len).batch(batch_size)
+test_dataset = test_dataset.batch(batch_size)
+
+xsize = np.shape(dataset)[2]
+ysize = np.shape(dataset)[1]
+num_of_train_data = int(data_len * 0.9)
+num_of_test_data = int(data_len * 0.1)
+
+"""Datasave"""
+main_dir = os.path.join(current_dir, "FCNN_labyrinth_2025_0625")
+if os.path.exists(main_dir) == False:
+    os.mkdir(main_dir)
+save_dir = os.path.join(main_dir,"_Tstep" + str(num_diffusion_steps) + "_betaend" + str(betaend) + "_epoch" + str(num_epochs) + "_basefilter" + str(base_filters))
+
+training = "OFF"
+figsave = "ON"
+figshow = "OFF"
+
+"""buffer_size는 트레이닝 데이터 수보다 많아야 한다??"""
+
+
+def sigmoid(x):
+    return 1 / (1 + np.exp(-x))
+
+
+def make_beta_schedule(schedule=schedule, n_timesteps=1000, start=1e-4, end=0.02):
+    if schedule == 'linear':
+        betas = np.linspace(start, end, n_timesteps)
+    elif schedule == "quad":
+        betas = np.linspace(start ** 0.5, end ** 0.5, n_timesteps) ** 2
+    elif schedule == "sigmoid":
+        betas = np.linspace(-6, 6, n_timesteps)
+        betas = sigmoid(betas) * (end - start) + start
+    return betas
+
+
+betas = make_beta_schedule(n_timesteps=num_diffusion_steps, start=betastart, end=betaend)
+alphas = 1 - betas
+alphas_prod = np.cumprod(alphas, axis=0).astype(np.float32)
+alphas_bar_sqrt = np.sqrt(alphas_prod)
+
+"""for Unet"""
+
+
+# Sinusoidal Time Embedding
+def get_timestep_embedding(timesteps, embedding_dim=128, max_period=10000):
+    half_dim = embedding_dim // 2
+    exponents = -np.log(max_period) * np.arange(half_dim) / half_dim
+    freqs = tf.exp(tf.constant(exponents, dtype=tf.float32))
+    args = tf.cast(tf.expand_dims(timesteps, -1), tf.float32) * freqs
+    return tf.concat([tf.sin(args), tf.cos(args)], axis=-1)
+
+
+# Time Embedding Layer (Sinusoidal + MLP)
+class TimeEmbedding(tf.keras.layers.Layer):
+    def __init__(self, embedding_dim):
+        super().__init__()
+        self.dense1 = tf.keras.layers.Dense(embedding_dim * 4, activation="relu")
+        self.dense2 = tf.keras.layers.Dense(embedding_dim)
+
+    def call(self, t):
+        emb = get_timestep_embedding(t, self.dense1.units // 4)
+        return self.dense2(self.dense1(emb))  # shape: [B, embedding_dim]
+
+
+# Residual Block with Time Conditioning
+
+class ResBlock(tf.keras.layers.Layer):
+    def __init__(self, filters):
+        super().__init__()
+        self.conv1 = tf.keras.layers.Conv2D(filters, 3, padding='valid')
+        self.norm1 = tf.keras.layers.BatchNormalization()
+        self.conv2 = tf.keras.layers.Conv2D(filters, 3, padding='valid')
+        self.norm2 = tf.keras.layers.BatchNormalization()
+        self.activation = tf.keras.layers.Activation("relu")
+        self.skip = tf.keras.layers.Conv2D(filters, 1, padding='same')
+        self.time_proj = tf.keras.layers.Dense(filters)
+
+    def periodic_pad(self, x, pad=1):
+        """x: (batch, H, W, C), pad: padding size"""
+        top = x[:, -pad:, :, :]
+        bottom = x[:, :pad, :, :]
+        x_padded = tf.concat([top, x, bottom], axis=1)
+
+        left = x_padded[:, :, -pad:, :]
+        right = x_padded[:, :, :pad, :]
+        x_padded = tf.concat([left, x_padded, right], axis=2)
+
+        return x_padded
+
+    def call(self, x, t_emb):
+
+        h = self.periodic_pad(x, pad=1)
+        h = self.conv1(self.activation(self.norm1(h)))
+        time_bias = tf.reshape(self.time_proj(t_emb), [-1, 1, 1, h.shape[-1]])
+        h = h + time_bias
+
+        h = self.periodic_pad(h, pad=1)
+        h = self.conv2(self.activation(self.norm2(h)))
+        return h + self.skip(x)
+
+# UNet Architecture
+
+def build_fcnn_unet(base=64, t_dim=128, levels=3):
+    xin = tf.keras.Input(shape=(None, None, 3))   # **가변 해상도**
+    tin = tf.keras.Input(shape=(), dtype=tf.int32)
+    t_emb = TimeEmbedding(t_dim)(tin)
+
+    downs, feats = [], []
+    x = xin
+    # ↓ Down-path: 스트라이드=2 Conv (Dense 제거, Spatial-independent)
+    for i in range(levels):
+        x = ResBlock(base * 2**i)(x, t_emb)
+        feats.append(x)                    # skip 저장
+        x = ResBlock(base * 2**i)(x, t_emb)
+        downs.append(x)
+        x = tf.keras.layers.Conv2D(base * 2**i, 3, strides=2, padding="same")(x)  # downsample
+
+    # Bottleneck
+    x = ResBlock(base * 2**levels)(x, t_emb)
+
+    # ↑ Up-path: ConvTranspose로 업샘플
+    for i in reversed(range(levels)):
+        x = tf.keras.layers.Conv2DTranspose(base * 2**i, 3, strides=2, padding="same")(x)
+        x = tf.concat([x, feats[i]], axis=-1)     # skip-connection
+        x = ResBlock(base * 2**i)(x, t_emb)
+
+    out = tf.keras.layers.Conv2D(3, 1, padding="same")(x)
+    return tf.keras.Model([xin, tin], out)
+
+
+net = build_fcnn_unet(base=base_filters, t_dim=time_embedding_dim, levels = 3)
+net.summary()
+
+optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate)
+ckpt = tf.train.Checkpoint(step=tf.Variable(1), optimizer=optimizer, net=net)
+manager = tf.train.CheckpointManager(ckpt, save_dir, max_to_keep=5)
+
+
+@tf.function
+def train_step(x, e, alphas_bar_t, t_index):
+    with tf.GradientTape() as tape:
+        """지금은 x0를 받아서 xt를 train step 안에서 계산하고 있음"""
+        # alphas_bar_t = tf.broadcast_to(alphas_bar_t, [-1, xsize * ysize * 3])
+        # print(alphas_bar_t.shape)
+        alphas_bar_t = tf.tile(alphas_bar_t, [1, xsize * ysize * 3])
+        alphas_bar_t = tf.reshape(alphas_bar_t, [-1, xsize, ysize, 3])
+
+        x_t = tf.multiply(tf.sqrt(alphas_bar_t), x) + tf.multiply(tf.sqrt(tf.ones_like(alphas_bar_t) - alphas_bar_t), e)
+        t_label = tf.cast(t_index + 1, dtype=tf.float32)
+        # t_label = tf.broadcast_to(t_label, [batch_size, xsize * ysize * 1])
+        # t_label = tf.reshape(t_label, [batch_size, xsize, ysize, 1])
+        # x_t_with_t_label = tf.concat([x_t, t_label], axis=-1)
+        # logits = net(x_t_with_t_label, training=False)
+
+        logits = net([x_t, t_label], training=True)
+
+        loss_value = tf.keras.losses.MSE(e, logits)
+    grads = tape.gradient(loss_value, net.trainable_weights)
+    optimizer.apply_gradients(zip(grads, net.trainable_weights))
+    return loss_value
+
+
+@tf.function
+def test_step(x, e, alphas_bar_t, t_index):
+    # alphas_bar_t = tf.broadcast_to(alphas_bar_t, [batch_size, xsize * ysize * 3])
+    alphas_bar_t = tf.tile(alphas_bar_t, [1, xsize * ysize * 3])
+    alphas_bar_t = tf.reshape(alphas_bar_t, [-1, xsize, ysize, 3])
+    x_t = tf.multiply(tf.sqrt(alphas_bar_t), x) + tf.multiply(tf.sqrt(tf.ones_like(alphas_bar_t) - alphas_bar_t), e)
+    t_label = tf.cast(t_index + 1, dtype=tf.float32)
+
+    # t_label = tf.broadcast_to(t_label, [batch_size, xsize * ysize * 1])
+    # t_label = tf.reshape(t_label, [batch_size, xsize, ysize, 1])
+    # x_t_with_t_label = tf.concat([x_t, t_label], axis=-1)
+
+    # logits = net(x_t_with_t_label, training=False)
+
+    logits = net([x_t, t_label], training=False)
+
+    val_loss_value = tf.keras.losses.MSE(e, logits)
+    return val_loss_value
+
+
+train_loss_graph = []
+test_loss_graph = []
+
+if training == "OFF":
+    num_epochs = 0
+
+status = ckpt.restore(manager.latest_checkpoint)
+start_time = time.time()
+
+for epoch in range(num_epochs):
+    # Iterate over the batches of the dataset.
+    loss_values = []
+    testloss_values = []
+
+    for step, x_batch_train in enumerate(train_dataset):
+        e = np.random.normal(0, 1, size=(len(x_batch_train), xsize, ysize, 3)).astype(np.float32)
+        t_index = np.random.randint(0, num_diffusion_steps, (len(x_batch_train), 1))
+        alphas_bar_t = alphas_prod[t_index]
+        loss_value = train_step(x_batch_train, e, alphas_bar_t, t_index)
+        for loss in loss_value:
+            loss_values.append(tf.reduce_mean(loss, axis=(-1, -2)))
+
+    if epoch % 10 == 0:
+        for step, x_batch_test in enumerate(test_dataset):
+
+            e_test = np.random.normal(0, 1, size=(len(x_batch_test), xsize, ysize, 3)).astype(np.float32)
+            t_index_test = np.random.randint(0, num_diffusion_steps, (len(x_batch_test), 1))
+            alphas_bar_t_test = alphas_prod[t_index_test]
+            test_loss_value = test_step(x_batch_test, e_test, alphas_bar_t_test, t_index_test)
+            for loss in test_loss_value:
+                testloss_values.append(tf.reduce_mean(loss, axis=(-1, -2)))
+
+        print("\nStart of epoch %d" % (epoch,))
+        print("training loss =", tf.get_static_value(tf.reduce_mean(loss_values)))
+        train_loss_graph.append(tf.get_static_value(tf.reduce_mean(loss_values)))
+        print("test loss =", tf.get_static_value(tf.reduce_mean(testloss_values)))
+        test_loss_graph.append(tf.get_static_value(tf.reduce_mean(testloss_values)))
+        ckpt.step.assign_add(1)
+        manager.save()
+        print("Time taken: %.2fs" % (time.time() - start_time))
+        start_time = time.time()
+print('end')
+
+
+if not num_epochs == 0:
+    # save_path = manager.save()
+    manager.save()
+    np.savetxt(os.path.join(os.getcwd(), save_dir) + "\\trainloss.csv", train_loss_graph, delimiter=',')
+    np.savetxt(os.path.join(os.getcwd(), save_dir) + "\\testloss.csv", test_loss_graph, delimiter=',')
+    pramdict = {"img_size": xsize, "num_of_train_data": num_of_train_data, "num_of_test_data": num_of_test_data,
+                "num_steps": num_diffusion_steps, "batch_size": 100
+        , "total_epoch": num_epochs, "schedule": schedule, "beta_start": betastart, "beta_end": betaend,
+                "learning_rate": learning_rate}
+    def save_dict_to_file(dir, dic):
+        f = open(dir + '\\param.txt', 'w')
+        f.write(str(dic))
+        f.close()
+    def load_dict_from_file():
+        f = open('\\param.txt', 'r')
+        data = f.read()
+        f.close()
+        return eval(data)
+    save_dict_to_file(save_dir, pramdict)
+""""""
+
+def mangetization(xt):
+    shape = np.shape(xt)
+    dimlen = len(shape)
+    # print(dimlen)
+    for i in range(dimlen - 1):
+        xt = np.mean(xt, axis=0)
+        # print(np.shape(xt))
+
+    sx = xt[0]
+    sy = xt[1]
+    sz = xt[2]
+
+    magnetization = sz
+    return magnetization
+
+def spin2rgb(X):
+    def normalize(v, axis=-1):
+        norm = np.linalg.norm(v, ord=2, axis=axis, keepdims=True)
+        return norm, np.nan_to_num(v / norm)
+
+    def hsv2rgb(hsv):
+        hsv = np.asarray(hsv)
+        if hsv.shape[-1] != 3: raise ValueError(
+            "Last dimension of input array must be 3; " "shape {shp} was found.".format(shp=hsv.shape))
+        in_shape = hsv.shape
+        hsv = np.array(hsv, copy=False, dtype=np.promote_types(hsv.dtype, np.float32), ndmin=2)
+        h, s, v = hsv[..., 0], hsv[..., 1], hsv[..., 2]
+        r, g, b = np.empty_like(h), np.empty_like(h), np.empty_like(h)
+
+        i = (h * 6.0).astype(int)
+        f = (h * 6.0) - i
+        p = v * (1.0 - s)
+        q = v * (1.0 - s * f)
+        t = v * (1.0 - s * (1.0 - f))
+
+        idx = i % 6 == 0
+        r[idx], g[idx], b[idx] = v[idx], t[idx], p[idx]
+
+        idx = i == 1
+        r[idx], g[idx], b[idx] = q[idx], v[idx], p[idx]
+
+        idx = i == 2
+        r[idx], g[idx], b[idx] = p[idx], v[idx], t[idx]
+
+        idx = i == 3
+        r[idx], g[idx], b[idx] = p[idx], q[idx], v[idx]
+
+        idx = i == 4
+        r[idx], g[idx], b[idx] = t[idx], p[idx], v[idx]
+
+        idx = i == 5
+        r[idx], g[idx], b[idx] = v[idx], p[idx], q[idx]
+
+        idx = s == 0
+        r[idx], g[idx], b[idx] = v[idx], v[idx], v[idx]
+
+        rgb = np.stack([r, g, b], axis=-1)
+        return rgb.reshape(in_shape)
+
+    norm, normed_X = normalize(X)
+    norm = np.clip(norm, 0, 1)
+    X = norm * normed_X
+    sxmap, symap, szmap = np.split(X, 3, axis=-1)
+    szmap = 0.5 * szmap + (norm / 2.)
+    H = np.clip(-np.arctan2(sxmap, -symap) / (2 * np.pi) + 0.5, 0, 1)
+    S = np.clip(2 * np.minimum(szmap, norm - szmap), 0, norm)
+    V = np.clip(2 * np.minimum(norm, szmap + norm / 2.) - 1.5 * norm + 0.5, 0.5 - 0.5 * norm, 0.5 + 0.5 * norm)
+    img = np.concatenate((H, S, V), axis=-1)
+    for i, map in enumerate(img): img[i] = hsv2rgb(map)
+    return img
+
+def test_x0_to_xt(x0, t):
+    if t == 0:
+        x_t = x0
+    else:
+        shape = np.shape(x0)
+        e_test = np.random.normal(0, 1, size=shape)
+        t_index = t
+        alphas_bar_t = alphas_prod[t_index - 1]
+        x_t = np.sqrt(alphas_bar_t) * x0 + np.sqrt(1 - alphas_bar_t) * e_test
+    return x_t
+
+def test_xa_to_xb(xa, a,b):
+    shape = np.shape(xa)
+    e_test = np.random.normal(0, 1, size=shape)
+    a_index = a
+    alphas_bar_a = alphas_prod[a_index - 1]
+    b_index = b
+    alphas_bar_b = alphas_prod[b_index - 1]
+
+    xb = np.sqrt(alphas_bar_b/alphas_bar_a) * xa + np.sqrt(1 - alphas_bar_b/alphas_bar_a) * e_test
+    return xb
+
+def multi_figure_save_module(test_sample, testnumber_start, testnumber_end, dir_category, file_name, figsave, figshow):
+    limited_test_sample = test_sample[testnumber_start:testnumber_end]
+    img = spin2rgb(limited_test_sample)
+    fig = plt.figure()
+    fig.set_figheight(np.shape(limited_test_sample)[1])
+    fig.set_figwidth(np.shape(limited_test_sample)[2])
+    testnumber = 0
+    for i in range(testnumber_end - testnumber_start):
+        ax = fig.add_subplot(1, np.shape(limited_test_sample)[0], testnumber + 1)
+        plt.axis('off')
+        ax.imshow(img[testnumber])
+        testnumber += 1
+    if figsave == "ON":
+        img_save_dir = os.path.join(os.getcwd(), save_dir) + "\\" + dir_category
+        if os.path.exists(img_save_dir) == False:
+            os.mkdir(img_save_dir)
+        plt.savefig(img_save_dir + "\\" + file_name + "_test_sample_%d_" % (testnumber_start) + "to_%d_" % (
+            testnumber_end) + ".png", bbox_inches='tight', pad_inches=0)
+    if figshow == "ON":
+        plt.show()
+    plt.cla()
+    plt.clf()
+    plt.close()
+
+def figure_save_module(test_sample, testnumber, dir_category, file_name, figsave, figshow):
+    limited_test_sample = test_sample[testnumber]
+    img = spin2rgb(limited_test_sample)
+    plt.figure()
+    plt.axis('off')
+    plt.imshow(img)
+    if figsave == "ON":
+        img_save_dir = os.path.join(os.getcwd(), save_dir) + "\\" + dir_category
+        if os.path.exists(img_save_dir) == False:
+            os.mkdir(img_save_dir)
+        plt.savefig(img_save_dir + "\\" + file_name + "_test_sample_" + "num_%d_" % (testnumber) + ".png",
+                    bbox_inches='tight', pad_inches=0)
+    if figshow == "ON":
+        plt.show()
+    plt.cla()
+    plt.clf()
+    plt.close()
+
+def normalization(spinmap_n_n_3):
+    norm_map = np.linalg.norm(spinmap_n_n_3, ord=2, axis=-1, keepdims=True)
+    mean_norm = np.mean(norm_map)
+    norm_spinmap = spinmap_n_n_3 / norm_map
+    return norm_spinmap, mean_norm, norm_map
+
+def energy(spin_map,J,DMB,DMN, Bz):
+    def normalization(spin_map):
+        result = spin_map / tf.sqrt(tf.reduce_sum(tf.square(spin_map), axis=-1, keepdims=True))
+        return result
+    xpadded_spin_map = tf.concat([spin_map[:, -1:, :, :], spin_map, spin_map[:, :1, :, :]], axis=1)
+    padded_spin_map = tf.concat([xpadded_spin_map[:, :, -1:, :], xpadded_spin_map, xpadded_spin_map[:, :, :1, :]], axis=2)
+
+    exchange_filter = np.zeros([3, 3, 3, 3])
+    for i in range(3):
+        for j in range(3):
+            if i == 1 and j == 0:
+                exchange_filter[i, j, 0, 0] = J
+                exchange_filter[i, j, 1, 1] = J
+                exchange_filter[i, j, 2, 2] = J
+            elif i == 1 and j == 2:
+                exchange_filter[i, j, 0, 0] = J
+                exchange_filter[i, j, 1, 1] = J
+                exchange_filter[i, j, 2, 2] = J
+            elif i == 0 and j == 1:
+                exchange_filter[i, j, 0, 0] = J
+                exchange_filter[i, j, 1, 1] = J
+                exchange_filter[i, j, 2, 2] = J
+            elif i == 2 and j == 1:
+                exchange_filter[i, j, 0, 0] = J
+                exchange_filter[i, j, 1, 1] = J
+                exchange_filter[i, j, 2, 2] = J
+
+    exchange_filter = tf.constant(exchange_filter, dtype=tf.float32)
+    ex_heff = tf.nn.conv2d(padded_spin_map, exchange_filter, [1, 1, 1, 1], "VALID")
+
+    ##DM field
+    dm_filter = np.zeros([3, 3, 3, 3])
+
+    for i in range(3):
+        for j in range(3):
+            if i == 0 and j == 1:
+                dm_filter[i, j, 2, 0] = -DMB
+                dm_filter[i, j, 0, 2] = DMB
+                dm_filter[i, j, 2, 1] = -DMN
+                dm_filter[i, j, 1, 2] = DMN
+            if i == 1 and j == 0:
+                dm_filter[i, j, 2, 1] = -DMB
+                dm_filter[i, j, 1, 2] = DMB
+                dm_filter[i, j, 2, 0] = DMN
+                dm_filter[i, j, 0, 2] = -DMN
+            if i == 1 and j == 2:
+                dm_filter[i, j, 2, 1] = DMB
+                dm_filter[i, j, 1, 2] = -DMB
+                dm_filter[i, j, 2, 0] = -DMN
+                dm_filter[i, j, 0, 2] = DMN
+            if i == 2 and j == 1:
+                dm_filter[i, j, 2, 0] = DMB
+                dm_filter[i, j, 0, 2] = -DMB
+                dm_filter[i, j, 2, 1] = DMN
+                dm_filter[i, j, 1, 2] = -DMN
+
+    dm_filter = tf.constant(dm_filter, dtype=tf.float32)
+    dm_heff = tf.nn.conv2d(padded_spin_map, dm_filter, [1, 1, 1, 1], "VALID")
+
+    ext_heff = tf.constant([0.0, 0.0, Bz], dtype=tf.float32)
+    ext_heff = tf.reshape(ext_heff, [1, 1, 1, 3])  # broadcast to lattice
+
+    # ---------- total effective field ----------
+    heff = ex_heff + dm_heff + ext_heff
+
+
+
+    # return K.mean(tf.reshape(-tf.reduce_sum(tf.multiply(tf.math.l2_normalize(spin_map), heff / 2.), axis=-1), [tf.shape(spin_map)[0], -1]),axis=-1)
+
+    # return tf.reduce_sum(-tf.reduce_sum(tf.multiply(tf.math.l2_normalize(spin_map), heff / 2.),axis=-1),axis=[1, 2])
+    return -tf.reduce_sum(tf.multiply(tf.math.l2_normalize(spin_map), heff / 2.))
+
+
+
+
+testbatch_start = 0
+testbatch_end = 1
+num_steps = 1000
+testnumber = 0
+test_set = dataset[int(data_len*0.9):, :, :, :]
+test_sample = test_set[testbatch_start:testbatch_end]
+
+
+
+ForGenTstart = 500
+fusion_start = 100
+ForGenTend= 0
+
+
+dir_category = "image\\FCNN"
+#
+#
+# """heating"""
+# """
+# heating 혹은 cooling은 총 N회 진행 가능하다 따라서 T=0부터 T=N까지
+# x0 -> x1 을 해주는 알파는 a[0]
+# """
+# """initial shape"""
+#
+# x_seed = np.random.normal(0, 1, size = (testbatch_end-testbatch_start,256,256,3))
+#
+# """cooling1"""
+# x_t = x_seed
+# figure_save_module(x_t, testnumber=testnumber, dir_category=dir_category,
+#                            file_name="seed", figsave=figsave, figshow=figshow)
+#
+# """cooling"""
+#
+# for j in range(ForGenTstart):
+#     before_t_label = ForGenTstart - j
+#     print(before_t_label)
+#     t = tf.constant([before_t_label], dtype=tf.float32)
+#     t = tf.tile(t, [testbatch_end - testbatch_start])
+#     e_theta_t = net.predict([x_t, t])
+#     z = np.random.normal(0, 1, size=np.shape(e_theta_t))
+#     alpha_t = alphas[before_t_label - 1]
+#     alpha_t_bar = alphas_prod[before_t_label - 1]
+#     x_tm1 = (1.0 / np.sqrt(alpha_t)) * (x_t - (1.0 - alpha_t) / (np.sqrt(1.0 - alpha_t_bar)) * e_theta_t) + np.sqrt(1.0 - alpha_t) * z
+#     x_t = x_tm1
+#     if (before_t_label - 1) % 100 == 0:
+#         figure_save_module(x_t, testnumber=testnumber, dir_category=dir_category,
+#                            file_name="cooling_T%d" % (before_t_label - 1), figsave=figsave, figshow=figshow)
+#
+# figure_save_module(x_t, testnumber=testnumber, dir_category=dir_category,
+#                            file_name="cooling_T%d" % (before_t_label - 1), figsave=figsave, figshow=figshow)
+#
+# print("reverse end")
+
+
+# """-----field bias-----"""
+#
+# imgsize = 512
+#
+# annealing_number = 1000
+# annealing_gap = ForGenTstart
+# annealing_T = ForGenTstart - annealing_gap
+#
+# field_bias = 0.03
+# dir_category = "image\\Field_bias\\imgsize%d_zdirection003"%(imgsize)
+# img_save_dir = os.path.join(os.getcwd(), save_dir) + "\\" + dir_category
+#
+# x_seed = np.random.normal(0, 1, size = (testbatch_end-testbatch_start,imgsize,imgsize,3))
+# x_t = x_seed
+#
+# num_defects = []
+# Es = []
+# Es_low = []
+#
+# for i in range(annealing_number):
+#     x_t = test_x0_to_xt(x_t, ForGenTstart)
+#     figure_save_module(x_t, testnumber=testnumber, dir_category=dir_category,file_name="Annealing_num_%d_cooling_T%d" % (i, ForGenTstart), figsave=figsave,figshow=figshow)
+#     np.save(img_save_dir + "\\" + "Annealing_num_%d_cooling_T%d" % (i, ForGenTstart) + ".npy", x_t)
+#
+#     for j in range(annealing_gap):
+#         before_t_label = ForGenTstart - j
+#         print(before_t_label)
+#         t = tf.constant([before_t_label], dtype=tf.float32)
+#         t = tf.tile(t, [testbatch_end - testbatch_start])
+#         e_theta_t = net.predict([x_t, t])
+#         z = np.random.normal(0, 1, size=np.shape(e_theta_t))
+#
+#         """bias field"""
+#         bias = np.zeros_like(z)
+#         # bias[..., 0] = field_bias
+#         # bias[..., 1] = field_bias
+#         bias[..., 2] = field_bias
+#
+#         z = z + bias
+#
+#         alpha_t = alphas[before_t_label - 1]
+#         alpha_t_bar = alphas_prod[before_t_label - 1]
+#         x_tm1 = (1.0 / np.sqrt(alpha_t)) * (x_t - (1.0 - alpha_t) / (np.sqrt(1.0 - alpha_t_bar)) * e_theta_t) + np.sqrt(1.0 - alpha_t) * z
+#         if before_t_label < fusion_start:
+#             x_tm1 = (1.0 / np.sqrt(alpha_t)) * (x_t - (1.0 - alpha_t) / (np.sqrt(1.0 - alpha_t_bar)) * e_theta_t)
+#         x_t = x_tm1
+#         E = energy(tf.cast(x_t, tf.float32), 1.0, 0, 0.3,0.0).numpy()[0]
+#         Es.append(E)
+#         if (before_t_label - 1 ) % 50 == 0:
+#             figure_save_module(x_t, testnumber=testnumber, dir_category=dir_category,
+#                                file_name="Annealing_num_%d_cooling_T%d" % (i,before_t_label - 1), figsave=figsave, figshow=figshow)
+#             np.save(img_save_dir + "\\" + "Annealing_num_%d_cooling_T%d" % (i,before_t_label - 1) + ".npy", x_t)
+#     print("reverse end")
+#
+#     print("energy",E)
+#     Es_low.append(E)
+#     defects = spin_to_defects(x_t[0])
+#     plt.imsave(img_save_dir + "\\" + "Annealing_num_%d_cooling_T%d_defects" % (i,before_t_label - 1) + ".png",defects, vmin = -1, vmax = 1)
+#     num_defect = np.sum(abs(defects))
+#     print("number of defects",num_defect)
+#     num_defects.append(num_defect)
+#     plt.imsave(img_save_dir + "\\" + "Annealing_num_%d_cooling_T%d_defects" % (i, before_t_label - 1) + ".png", defects, vmin=-1, vmax=1)
+#     x_t_fft = np.fft.fftshift(np.fft.fft2(x_t[0, :, :, 2], norm='ortho'))
+#     plt.imsave(img_save_dir + "\\" + "Annealing_num_%d_cooling_T%d_fft" % (i, before_t_label - 1) + ".png", np.abs(x_t_fft), cmap = 'gray')
+#
+#
+#
+# np.savetxt(img_save_dir + "\\" + "Annealing_Energy" + ".csv", Es)
+# np.savetxt(img_save_dir + "\\" + "Annealing_Energy_low" + ".csv", Es_low)
+# np.savetxt(img_save_dir + "\\" + "number_of_defects" + ".csv", num_defects)
+
+"""-----Score-Guided Diffusion Annealing(SGDA)-----"""
+
+def get_h_eff(spin_map,J,DMB,DMN, Bz):
+    def normalization(spin_map):
+        result = spin_map / tf.sqrt(tf.reduce_sum(tf.square(spin_map), axis=-1, keepdims=True))
+        return result
+    xpadded_spin_map = tf.concat([spin_map[:, -1:, :, :], spin_map, spin_map[:, :1, :, :]], axis=1)
+    padded_spin_map = tf.concat([xpadded_spin_map[:, :, -1:, :], xpadded_spin_map, xpadded_spin_map[:, :, :1, :]], axis=2)
+
+    exchange_filter = np.zeros([3, 3, 3, 3])
+    for i in range(3):
+        for j in range(3):
+            if i == 1 and j == 0:
+                exchange_filter[i, j, 0, 0] = J
+                exchange_filter[i, j, 1, 1] = J
+                exchange_filter[i, j, 2, 2] = J
+            elif i == 1 and j == 2:
+                exchange_filter[i, j, 0, 0] = J
+                exchange_filter[i, j, 1, 1] = J
+                exchange_filter[i, j, 2, 2] = J
+            elif i == 0 and j == 1:
+                exchange_filter[i, j, 0, 0] = J
+                exchange_filter[i, j, 1, 1] = J
+                exchange_filter[i, j, 2, 2] = J
+            elif i == 2 and j == 1:
+                exchange_filter[i, j, 0, 0] = J
+                exchange_filter[i, j, 1, 1] = J
+                exchange_filter[i, j, 2, 2] = J
+
+    exchange_filter = tf.constant(exchange_filter, dtype=tf.float32)
+    ex_heff = tf.nn.conv2d(padded_spin_map, exchange_filter, [1, 1, 1, 1], "VALID")
+
+    ##DM field
+    dm_filter = np.zeros([3, 3, 3, 3])
+
+    for i in range(3):
+        for j in range(3):
+            if i == 0 and j == 1:
+                dm_filter[i, j, 2, 0] = -DMB
+                dm_filter[i, j, 0, 2] = DMB
+                dm_filter[i, j, 2, 1] = -DMN
+                dm_filter[i, j, 1, 2] = DMN
+            if i == 1 and j == 0:
+                dm_filter[i, j, 2, 1] = -DMB
+                dm_filter[i, j, 1, 2] = DMB
+                dm_filter[i, j, 2, 0] = DMN
+                dm_filter[i, j, 0, 2] = -DMN
+            if i == 1 and j == 2:
+                dm_filter[i, j, 2, 1] = DMB
+                dm_filter[i, j, 1, 2] = -DMB
+                dm_filter[i, j, 2, 0] = -DMN
+                dm_filter[i, j, 0, 2] = DMN
+            if i == 2 and j == 1:
+                dm_filter[i, j, 2, 0] = DMB
+                dm_filter[i, j, 0, 2] = -DMB
+                dm_filter[i, j, 2, 1] = DMN
+                dm_filter[i, j, 1, 2] = -DMN
+
+    dm_filter = tf.constant(dm_filter, dtype=tf.float32)
+    dm_heff = tf.nn.conv2d(padded_spin_map, dm_filter, [1, 1, 1, 1], "VALID")
+
+    ext_heff = tf.constant([0.0, 0.0, Bz], dtype=tf.float32)
+    ext_heff = tf.reshape(ext_heff, [1, 1, 1, 3])  # broadcast to lattice
+
+    # ---------- total effective field ----------
+    heff = ex_heff + dm_heff + ext_heff
+
+
+
+    # return K.mean(tf.reshape(-tf.reduce_sum(tf.multiply(tf.math.l2_normalize(spin_map), heff / 2.), axis=-1), [tf.shape(spin_map)[0], -1]),axis=-1)
+
+    # return tf.reduce_sum(-tf.reduce_sum(tf.multiply(tf.math.l2_normalize(spin_map), heff / 2.),axis=-1),axis=[1, 2])
+    return heff
+
+
+ForGenTstart = 500
+testnumber = 0
+imgsize = 128
+field_bias = 0.05
+dir_category = "image\\SGDA\\imgsize%d_\\annealing_field_%1.2f"%(imgsize,field_bias)
+img_save_dir = os.path.join(os.getcwd(), save_dir) + "\\" + dir_category
+
+x_seed = np.random.normal(0, 1, size = (testbatch_end-testbatch_start,imgsize,imgsize,3))
+x_t = x_seed
+# x_t = test_sample
+# x_t = test_x0_to_xt(x_t, ForGenTstart)
+
+
+
+figure_save_module(x_t, testnumber=testnumber, dir_category=dir_category,file_name="original", figsave=figsave,figshow=figshow)
+np.save(img_save_dir + "\\" + "original" + ".npy", x_t)
+
+w = 1.0
+
+DTYPE = tf.float32
+
+def to_tensor(x):
+    """NumPy → TF Tensor (float32) 1-줄 헬퍼"""
+    return tf.convert_to_tensor(x, dtype=DTYPE)
+annealing_number = 300
+for i in range(annealing_number):
+    x_t = test_x0_to_xt(x_t, ForGenTstart)
+    figure_save_module(x_t, testnumber=testnumber, dir_category=dir_category,file_name="Annealing_num_%d_cooling_T%d" % (i, ForGenTstart), figsave=figsave,figshow=figshow)
+    np.save(img_save_dir + "\\" + "Annealing_num_%d_cooling_T%d" % (i, ForGenTstart) + ".npy", x_t)
+
+
+    for j in range(ForGenTstart):
+        before_t_label = ForGenTstart - j
+        print(before_t_label)
+        t = tf.constant([before_t_label], dtype=tf.float32)
+        t = to_tensor(tf.tile(t, [testbatch_end - testbatch_start]))
+        x_t = to_tensor(x_t)
+        e_theta_t = net([x_t, t], training=False)
+        z = tf.random.normal(tf.shape(e_theta_t), dtype=DTYPE)
+
+        alpha_t = to_tensor(alphas[before_t_label - 1])
+        alpha_t_bar = to_tensor(alphas_prod[before_t_label - 1])
+        sigma_t = tf.sqrt(1.0 - alpha_t_bar)
+
+
+
+
+        #
+        # x0_hat = to_tensor((x_t - sigma_t * e_theta_t) / tf.sqrt(alpha_t_bar))
+        # x_t = tf.constant(x_t, dtype=tf.float32)
+
+        # with tf.GradientTape() as tape:
+        #     # tape.watch(x0_hat)  # grad 대상
+        #     x_t = tf.math.l2_normalize(x_t, axis=-1)
+        #     tape.watch(x_t)
+        #     # E_batch = energy(x0_hat, 1.0, 0.0, 0.3,0.5)  # (B,)
+        #     E_batch = energy(x_t, 0.0, 0.0, 0.0,1.0)
+        # # grad_x0 = tape.gradient(E_batch, x0_hat)
+        # # grad_xt = grad_x0 / tf.sqrt(alpha_t_bar)
+        # grad_xt = tape.gradient(E_batch, x_t)
+        # print(sigma_t**3)
+        #
+        x_t2 = tf.math.l2_normalize(x_t, axis=-1)
+        h_eff = get_h_eff(x_t2, 0.0, 0.0, 0.0 , field_bias)
+        # h_eff = get_h_eff(x_t2, 1.0, 0.0, 0.3, field_bias)
+
+        # h_eff = get_h_eff(x_t, 1.0, 0.0, 0.3, 0.07)
+
+        # Gratio = 1.0 * sigma_t
+        Gratio = 1.0
+
+        damping = 0.1 * Gratio
+        damping = 1.0 * Gratio
+
+        # grad_xt = -Gratio*tf.linalg.cross(x_t, h_eff)-damping*tf.linalg.cross(x_t, tf.linalg.cross(x_t, h_eff))
+        grad_xt = - damping * tf.linalg.cross(x_t2, tf.linalg.cross(x_t2, h_eff))
+
+        dt = sigma_t
+        # dt = 1.0
+        print(sigma_t)
+
+        # with tf.GradientTape() as tape:
+        #     tape.watch(e_theta_t)
+        #     x0_hat = tf.math.l2_normalize(to_tensor((x_t - sigma_t * e_theta_t) / tf.sqrt(alpha_t_bar)), axis = -1)
+        #
+        #     # x_tm1_DDIM  = tf.math.l2_normalize((1.0 / tf.sqrt(alpha_t)) * (x_t - (1.0 - alpha_t) / sigma_t * e_theta_t), axis = -1)
+        #     # E_batch = energy(x_tm1_DDIM, 1.0, 0.0, 0.3,0.0)
+        #     E_batch = energy(x0_hat, 1.0, 0.0, 0.3, 5.0)
+        #
+        #     grad_e_theta_t = tape.gradient(E_batch, e_theta_t)
+
+        # print(grad_e_theta_t)
+        # print(e_theta_t)
+
+        #
+        # with tf.GradientTape() as tape:
+        #     tape.watch(x0_hat)
+        #     # tape.watch(x_t)
+        #     E_batch = energy(x0_hat, 1.0, 0.0, 0.6,0.0)  # (B,)
+        #     # E_batch = energy(x_t, -1.0, 0.0, 0.0,0.0)
+        # grad_x0 = tape.gradient(E_batch, x0_hat)  # (B,H,W,3)
+        # print(grad_x0)
+        # grad_xt = grad_x0 / tf.sqrt(alpha_t_bar)
+        # # grad_xt = tape.gradient(E_batch, x_t)
+
+        # guided_score = e_theta_t + w * (sigma_t ** 3) * grad_xt
+        # guided_score = e_theta_t + w * (sigma_t) * grad_xt
+        # guided_score = e_theta_t + w * grad_xt
+
+        # guided_e_theta_t = e_theta_t + w*grad_e_theta_t
+
+        # x_tm1 = (1.0 / tf.sqrt(alpha_t)) * (x_t - (1.0 - alpha_t) / sigma_t * guided_e_theta_t) + tf.sqrt(1.0 - alpha_t) * z
+
+
+        # x_tm1 = (1.0 / tf.sqrt(alpha_t)) * (x_t + (1-alpha_t)*dt * grad_xt - (1.0 - alpha_t) / sigma_t * e_theta_t) + tf.sqrt(1.0 - alpha_t) * z
+
+
+        # x_tm1 = (1.0 / tf.sqrt(alpha_t)) * (x_t + (1 - alpha_t) * (h_eff-x_t) - (1.0 - alpha_t) / sigma_t * e_theta_t) + tf.sqrt(1.0 - alpha_t) * z
+        # x_tm1 = (1.0 / tf.sqrt(alpha_t)) * (x_t2 + (1 - alpha_t) * (h_eff - x_t2) - (1.0 - alpha_t) / sigma_t * e_theta_t) + tf.sqrt(1.0 - alpha_t) * z
+        x_tm1 = (1.0 / tf.sqrt(alpha_t)) * (x_t + (1 - alpha_t)**2 * h_eff - (1.0 - alpha_t) / sigma_t * e_theta_t) + tf.sqrt(1.0 - alpha_t) * z
+
+        # x_tm1 = (1.0 / tf.sqrt(alpha_t)) * (x_t - grad_xt - (1.0 - alpha_t) / sigma_t * e_theta_t) + tf.sqrt(1.0 - alpha_t) * z
+        # x_tm1,_,_ = normalization(x_t - grad_xt)
+        # x_tm1,_,_ = normalization((1.0 / tf.sqrt(alpha_t)) * (x_t - grad_xt - (1.0 - alpha_t) / sigma_t * e_theta_t) + tf.sqrt(1.0 - alpha_t) * z)
+        # if before_t_label < fusion_start:
+        #     x_tm1 = (1.0 / tf.sqrt(alpha_t)) * (x_t - (1.0 - alpha_t) / sigma_t * guided_score)
+        x_t = x_tm1
+
+        # E = energy(tf.cast(x_t, tf.float32), 1.0, 0, 0.3,0.1).numpy()[0]
+        if (before_t_label - 1 ) % 50 == 0:
+            print(sigma_t)
+            figure_save_module(x_t, testnumber=testnumber, dir_category=dir_category,
+                               file_name="Annealing_num_%d_cooling_T%d" % (i, before_t_label-1), figsave=figsave, figshow=figshow)
+            np.save(img_save_dir + "\\" + "Annealing_num_%d_cooling_T%d" % (i, before_t_label-1) + ".npy", x_t)
+    print("reverse end")
+    figure_save_module(x_t, testnumber=testnumber, dir_category=dir_category,
+                               file_name="Annealing_num_%d_cooling_T%d" % (i, before_t_label-1), figsave=figsave, figshow=figshow)
+    np.save(img_save_dir + "\\" + "Annealing_num_%d_cooling_T%d" % (i, before_t_label-1) + ".npy", x_t)
+
+# print("energy",E)
+# Es_low.append(E)
+defects = spin_to_defects(x_t[0])
+plt.imsave(img_save_dir + "\\" + "cooling_T%d_defects" % (before_t_label - 1) + ".png", defects, vmin=-1, vmax=1)
+x_t_fft = np.fft.fftshift(np.fft.fft2(x_t[0, :, :, 2], norm='ortho'))
+plt.imsave(img_save_dir + "\\" + "cooling_T%d_fft" % (before_t_label - 1) + ".png", np.abs(x_t_fft), cmap = 'gray')
+#
+# np.savetxt(img_save_dir + "\\" + "Annealing_Energy" + ".csv", Es)
+# np.savetxt(img_save_dir + "\\" + "Annealing_Energy_low" + ".csv", Es_low)
