@@ -1,0 +1,163 @@
+import tensorflow as tf
+import os
+import tensorflow.keras.backend as K
+import pandas as pd
+import cv2
+import numpy as np
+import CustomLib.ImportModules_TVAEwithKLsum_fullVAE as IM
+import matplotlib.pyplot as plt
+from sklearn.decomposition import PCA
+from matplotlib.colors import hsv_to_rgb
+import time
+
+os.environ["CUDA_VISIBLE_DEVICES"]="0"
+
+for gpu in tf.config.experimental.list_physical_devices('GPU'):
+	tf.compat.v2.config.experimental.set_memory_growth(gpu, True)
+
+
+
+current_dir = os.getcwd()
+load_dir1 = os.path.join(current_dir, "Batch1000_size64_total100_sub100")
+train_set = []
+test_set = []
+
+file_name = "spinmap.npy"
+load_path = os.path.join(load_dir1, file_name)
+data = np.load(load_path)
+
+def getTdata_set(data_set, T):
+    index = int(T*10000)
+    Tdata_set =  data_set[index:index+1000]
+    return Tdata_set
+
+"""total data:100000 = 100 * 1000"""
+
+T_bin= np.shape(data)[0]
+EachT_num = np.shape(data)[1]
+IMAGE_SIZE = np.shape(data)[2]
+
+"""1000*100"""
+
+TrainRatio = 0.8
+train_num = int(EachT_num*TrainRatio)
+
+
+train_set = data[:,:int(EachT_num*TrainRatio),:,:,:]
+
+train_set = np.reshape(train_set, [T_bin*int(EachT_num*TrainRatio),IMAGE_SIZE,IMAGE_SIZE,1])
+zeros = np.zeros_like(train_set)
+zeros = np.concatenate([zeros,zeros], axis = -1)
+train_set = np.concatenate([zeros,train_set], axis = -1)
+
+test_set = data[:,int(EachT_num*TrainRatio):,:,:,:]
+test_set = np.reshape(test_set, [T_bin*(EachT_num-int(EachT_num*(TrainRatio))),IMAGE_SIZE,IMAGE_SIZE,1])
+print(test_set.shape)
+zeros = np.zeros_like(test_set)
+zeros = np.concatenate([zeros,zeros], axis = -1)
+test_set = np.concatenate([zeros,test_set], axis = -1)
+
+epochs = 150
+batch_size = 300
+
+encoder_channels = [[6,12,24,48], [512]]
+decoder_channels = [[512],[24,12,6,3]]
+activation = "leakyrelu" # "leakyrelu", "relu", "softplus", "tanh", "linear"
+kernel_Size = 5
+batchNorm_bl, periodic_BC, last_Normalize = True, False, False
+learning_rate = 1e-3
+alpha, beta, encoding_dim = [1., 0.0002, 100]
+
+model_save_dir = os.path.join(os.getcwd(), "TVAE_ising", "EnDim" + str(encoding_dim).zfill(3) + "_" + activation,
+                              "Alpha" + format(alpha, ".3f") + "_Beta" + format(beta, ".4f"))
+model_save_path = os.path.join(model_save_dir, "Epoch{epoch:04d}-ValLoss{val_loss:.4f}")
+
+Initialize_on_off, Training_on_off, loading_on_off = True, False, True
+####initialize network
+if Initialize_on_off:
+    vae_model = IM.getVAEModel(IMAGE_SIZE, encoding_dim, encoder_channels, decoder_channels, activation,
+                               kernel_Size=kernel_Size, batchNorm_bl=batchNorm_bl, periodic_BC=periodic_BC, last_Normalize=last_Normalize,
+                               learning_rate=learning_rate, alpha=alpha, beta=beta)
+    vae_model.summary()
+    print("Model Compiled")
+
+
+    vae_model.save(os.path.join(model_save_dir, "Initial_Model_Structure"))
+    modelconfig_txt = open(os.path.join(model_save_dir, "model_config.txt"), "w")
+    modelconfig_txt.write("periodic_BC = " + str(periodic_BC) + ", ")
+    modelconfig_txt.write("last_Normalize = " + str(last_Normalize) + ", ")
+    modelconfig_txt.close()
+    print("Initial Model Structure Saved")
+
+####training
+if Training_on_off:
+
+    callbacks = IM.getCallBacks(model_save_path, save_best_only=False, save_weights_only=True)
+    history = vae_model.fit(train_set, epochs=epochs, batch_size=batch_size, shuffle=True, validation_data = (test_set, None), verbose=2, callbacks=[callbacks])
+    history_data = history.history
+    df_history_data = pd.DataFrame(history_data)
+    df_history_data.to_csv(os.path.join(model_save_dir, "history.csv"))
+    print("Training Complete")
+
+##load trained memories
+if loading_on_off:
+    vae_model = tf.keras.models.load_model(os.path.join(model_save_dir, "Initial_Model_Structure"))
+    bestmodel_path = IM.get_best_model_path(model_save_dir, mode="MaxEp")
+    print(bestmodel_path)
+    # bestmodel_path = IM.get_best_model_path(model_save_dir, mode="MinValLoss")
+    vae_model.load_weights(bestmodel_path[:-len(".index")])
+    # vae_model.load_weights(bestmodel_path)
+
+vae_model.Encoder, _= IM.getEncoderFromLoadedModel(vae_model,IMAGE_SIZE,periodic_BC)
+vae_model.Decoder = IM.getDecoderFromLoadedModel(vae_model, encoding_dim,periodic_BC,last_Normalize)
+
+
+"""magnetic moment with test set"""
+codes,_,_ = vae_model.Encoder.predict(test_set)
+decoded = vae_model.Decoder.predict(codes)
+
+print(np.shape(test_set))
+print(np.shape(decoded))
+
+
+
+meanTsquarenorms = []
+meanTnorms = []
+magnetizations = []
+Tstds = []
+for i in range(0,100):
+    index = i*200
+    Ttest_set = test_set[index:index+200,:]
+    Tdecoded = decoded[index:index+200,:]
+    Tnorms = []
+    Tsquarenorms = []
+    T = i * 3/100
+    for j in range(200):
+        # norm = np.abs(np.mean(Tdecoded[j,:,:,2]))
+        norm = np.mean(np.abs(Tdecoded[j, :, :, 2]))
+
+        Tnorms.append(norm)
+    meanTnorm = np.mean(Tnorms)
+    meanTnorms.append(meanTnorm)
+    Tstds.append(np.std(Tnorms))
+# # if i%10 ==0:
+#
+#     print(T)
+#     print(meanTnorm)
+#
+#     img = np.squeeze(IM.spin2rgb(Ttest_set[0]))
+#     plt.figure()
+#     plt.imshow(img)
+#     plt.imsave(load_dir1 + "\\input_%d.png" % (i), img)
+#     plt.close()
+#     # plt.show()
+#
+#
+#     img = np.squeeze(IM.spin2rgb(Tdecoded[0]))
+#     plt.figure()
+#     plt.imshow(img)
+#     plt.imsave(load_dir1 + "\\output_%d.png" % (i), img)
+#     plt.close()
+#     # plt.show()
+print(meanTnorms)
+np.savetxt(load_dir1 + "\\output_meanTnorms2.txt", meanTnorms)
