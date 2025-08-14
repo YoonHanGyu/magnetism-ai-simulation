@@ -1,0 +1,333 @@
+import os
+import tensorflow.compat.v1 as tf
+tf.disable_v2_behavior()
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.colors import hsv_to_rgb
+import pandas as pd
+import datetime
+import CustomLib.ImportModules_TVA0721 as IM
+
+
+
+
+##0번째 GPU를 쓰겠다는 의미
+os.environ["CUDA_VISIBLE_DEVICES"]="1"
+
+
+savefolder = "heat_bath_only_metastable_states_128by128_DM0.1_T0.0_21000samples_10000itr_21_11_16"
+
+##Howmany times do you want to simulate?
+Nstart = 1
+Nend = 211
+
+
+paramdict = {"Project_path": None,
+                     "SizeX": 128, "SizeY": 128, "Batch_Size":100,
+                     "Boundary": "X Periodic", "MaskMode": "None",
+                     "InitCondition": "Custom", "InitTheta": 0.00, "InitPhi": 0.00,
+                     "Engine": "MC", "Total_Iteration": 10000, "Sub_Iteration": 10000,
+                     "Tstart": 1.5, "Tend": 0.0, "Annealing%": 0.9,
+                     "exJ": 1.00, "DMB": 0.00, "DMN": 0.1,
+                     "Kx": 0.00, "Ky": 0.00, "Kz": 0.0,
+                     "KAmp": 0.00, "KTheta": 0.00, "KPhi": 0.00,
+                     "Kxy": 0.0, "KxyPhi": 0,
+                     "Dipole_On/Off": False, "DipoleRange": 0,
+                     "Dip": 0.0, "DipS": 0.0,
+                     "HextAmp": 0.000, "HTheta": 0, "HPhi": 0,
+                     "dJx": 0.00, "dJy": 0.00,
+                     "dDMxx": 0.00, "dDMyx": 0.00, "dDMzx": 0.00,
+                     "dDMxy": 0.00, "dDMyy": 0.00, "dDMzy": 0.00,
+                     "dDMxx3": 0.00, "dDMyx3": 0.00, "dDMzx3": 0.00,
+                     "dDMxy3": 0.00, "dDMyy3": 0.00, "dDMzy3": 0.00,
+                     "rdJ": 0.00, "rdDM": 0.00, "rdDM3": 0.00,
+                     "gammaG": 0.02, "alpha": 0.2, "MixR": 0.9}
+
+plotSaveDict = {"Plot": True,
+                        "PlotMap": "Snap",
+                        "GraphPlot": True,  # TODO
+                        "Interpolation": "None",
+                        "ColorImageSave": True,
+                        "XYZImageSave": False,
+                        "SpinMapExcelSave": False,
+                        "AveragedSpinMapExcelSave": True,
+                        "GraphExcelSave": True,  # TODO
+                        "CustomGraphName": "Ms"}
+
+"""parameters converting"""
+
+X_size = paramdict["SizeX"]
+Y_size = paramdict["SizeY"]
+batch_size = paramdict["Batch_Size"]
+total_iteration = paramdict["Total_Iteration"]
+sub_iteration = paramdict["Sub_Iteration"]
+
+J = paramdict["exJ"]
+DMB = paramdict["DMB"]
+DMN = paramdict["DMN"]
+
+h = paramdict["HextAmp"]
+h_theta = paramdict["HTheta"]
+h_phi = paramdict["HPhi"]
+
+aniKx = paramdict["Kx"]
+aniKy = paramdict["Ky"]
+aniKz = paramdict["Kz"]
+
+
+dipole_rangei = paramdict["DipoleRange"]
+dipole_rangej = paramdict["DipoleRange"]
+D = paramdict["Dip"]
+Ds = paramdict["DipS"]
+
+Tstart = paramdict["Tstart"]
+Tend = paramdict["Tend"]
+
+MixR = paramdict["MixR"]
+Ann = paramdict["Annealing%"]
+
+def spinMapExcelSave(X, paramDict, plotSaveDict, save_path):
+    '''임시로 스퀴즈 안씀'''
+##     sq_X = X.squeeze(axis=0)
+    sq_X = X
+    sx = pd.DataFrame(sq_X[:, :, 0])
+    sy = pd.DataFrame(sq_X[:, :, 1])
+    sz = pd.DataFrame(sq_X[:, :, 2])
+
+    paramdictpd = pd.DataFrame.from_dict(paramDict, orient='index')
+    plotSave_dictpd = pd.DataFrame.from_dict(plotSaveDict, orient='index')
+
+    excelwriter = pd.ExcelWriter(save_path + "_Snap.xlsx")
+    sx.to_excel(excelwriter, "Sx")
+    sy.to_excel(excelwriter, "Sy")
+    sz.to_excel(excelwriter, "Sz")
+    paramdictpd.to_excel(excelwriter, "ParamDict")
+    plotSave_dictpd.to_excel(excelwriter, "PlotSaveDict")
+    excelwriter.save()
+
+
+## 우리방에서 쓰는 색
+def getrgbvectormap(X):
+    '''임시로 스퀴즈는 뺐음'''
+    #     sq_X = X.squeeze(axis=0)
+    sq_X = X
+
+    norm, normsq_X = normalize(sq_X, axis=2)
+    norm = np.clip(norm, 0, 1)
+    sq_X = norm * normsq_X
+    norm = norm.squeeze(axis=2)
+    sxmap = sq_X[:, :, 0]
+    symap = sq_X[:, :, 1]
+    szmap = sq_X[:, :, 2]
+    szmap = 0.5 * szmap + (norm / 2.)
+    H = np.clip(-np.arctan2(sxmap, -symap) / (2 * np.pi) + 0.5, 0, 1)
+    S = np.clip(2 * np.minimum(szmap, norm - szmap), 0, norm)
+    V = np.clip(2 * np.minimum(norm, szmap + norm / 2.) - 1.5 * norm + 0.5, 0.5 - 0.5 * norm, 0.5 + 0.5 * norm)
+    hsv = np.stack((H, S, V), axis=2)
+    rgb = hsv_to_rgb(hsv)
+    return rgb
+
+def normalize(v, axis=-1):
+    norm = np.linalg.norm(v, ord=2, axis=axis, keepdims=True)
+    return norm, np.nan_to_num(v/norm)
+
+def colorimgSave(X, save_path, figsizex, figsizey, interpolation="None"):
+    rgb = getrgbvectormap(X)
+    fig = plt.figure(frameon=False)
+    fig.set_size_inches(figsizex, figsizey)
+    ax = plt.Axes(fig, [0., 0., 1., 1.])
+    ax.set_axis_off()
+    fig.add_axes(ax)
+    ax.imshow(rgb, interpolation=interpolation)
+    fig.savefig(save_path + ".png")
+    plt.close(fig)
+
+'''spin normalization function'''
+def normalization(spin_map):
+    result = spin_map/tf.sqrt(tf.reduce_sum(tf.square(spin_map), axis = -1, keepdims = True))
+    return result
+init_spin_map = normalization(np.random.randn(batch_size, X_size, Y_size, 3).astype(np.float32))
+'''spin_padding'''
+
+spin_map = tf.Variable(init_spin_map, trainable = False, dtype = tf.float32)
+
+
+
+xpadded_spin_map = tf.concat([spin_map[:, -1:, :, :], spin_map, spin_map[:, :1, :, :]], axis = 1)
+## xpadded_spin_map 사이즈 [batch_size, X_size + 2, Y_size, 3]
+padded_spin_map = tf.concat([xpadded_spin_map[:, :, -1:, :], xpadded_spin_map, xpadded_spin_map[:, :, :1, :]], axis = 2)
+## xpadded_spin_map 사이즈 [batch_size, X_size + 2, Y_size + 2, 3]
+
+
+xpadded_Dipspin_map = tf.concat([spin_map[:, -dipole_rangej:, :, :], spin_map, spin_map[:, :dipole_rangej, :, :]], axis = 1)
+padded_Dipspin_map = tf.concat([xpadded_Dipspin_map[:, :, -dipole_rangei:, :], xpadded_Dipspin_map, xpadded_Dipspin_map[:, :, :dipole_rangei, :]], axis = 2)
+
+'''field filter'''
+
+##exchange field
+
+##참고 np.zeros([x, y, 연산될 때 S의 xyz성분, 결과 heff의 xyz 성분])
+
+exchange_filter = np.zeros([3, 3, 3, 3])
+
+for i in range(3):
+    for j in range(3):
+        if i == 1 and j == 0:
+            exchange_filter[i, j, 0, 0] = J
+            exchange_filter[i, j, 1, 1] = J
+            exchange_filter[i, j, 2, 2] = J
+        elif i == 1 and j == 2:
+            exchange_filter[i, j, 0, 0] = J
+            exchange_filter[i, j, 1, 1] = J
+            exchange_filter[i, j, 2, 2] = J
+        elif i == 0 and j == 1:
+            exchange_filter[i, j, 0, 0] = J
+            exchange_filter[i, j, 1, 1] = J
+            exchange_filter[i, j, 2, 2] = J
+        elif i == 2 and j == 1:
+            exchange_filter[i, j, 0, 0] = J
+            exchange_filter[i, j, 1, 1] = J
+            exchange_filter[i, j, 2, 2] = J
+
+exchange_filter = tf.constant(exchange_filter, dtype=tf.float32)
+
+##스트라이드 : [배치에서 얼마나 건너 뛸지,x,y,스핀xyz] 보통 맨앞  맨뒤는 1로 고정시킨다.
+## 패딩은 SAME 와 VALID가 있고 전자는 인풋값과 같은 크기를 같은 결과를 내주려고 0값을 패딩,후자는 인풋과 아웃풋의 사이즈가 달라짐
+ex_heff = tf.nn.conv2d(padded_spin_map, exchange_filter, [1, 1, 1, 1], "VALID")
+## ex_heff = [batch_size, X_size, Y_size, 3]
+
+
+##DM field
+dm_filter = np.zeros([3, 3, 3, 3])
+
+for i in range(3):
+    for j in range(3):
+        if i == 0 and j == 1:
+            dm_filter[i, j, 2, 0] = -DMB
+            dm_filter[i, j, 0, 2] = DMB
+            dm_filter[i, j, 2, 1] = -DMN
+            dm_filter[i, j, 1, 2] = DMN
+        if i == 1 and j == 0:
+            dm_filter[i, j, 2, 1] = -DMB
+            dm_filter[i, j, 1, 2] = DMB
+            dm_filter[i, j, 2, 0] = DMN
+            dm_filter[i, j, 0, 2] = -DMN
+        if i == 1 and j == 2:
+            dm_filter[i, j, 2, 1] = DMB
+            dm_filter[i, j, 1, 2] = -DMB
+            dm_filter[i, j, 2, 0] = -DMN
+            dm_filter[i, j, 0, 2] = DMN
+        if i == 2 and j == 1:
+            dm_filter[i, j, 2, 0] = DMB
+            dm_filter[i, j, 0, 2] = -DMB
+            dm_filter[i, j, 2, 1] = DMN
+            dm_filter[i, j, 1, 2] = -DMN
+
+dm_filter = tf.constant(dm_filter, dtype=tf.float32)
+dm_heff = tf.nn.conv2d(padded_spin_map, dm_filter, [1, 1, 1, 1], "VALID")
+
+## anisotropy
+K_filter = np.zeros([1, 1, 3, 3])
+K_filter[0, 0, 0, 0] = 2 * aniKx
+K_filter[0, 0, 1, 1] = 2 * aniKy
+K_filter[0, 0, 2, 2] = 2 * aniKz
+
+K_filter = tf.constant(K_filter, dtype=tf.float32)
+K_heff = tf.nn.conv2d(spin_map, K_filter, [1, 1, 1, 1], "VALID")
+
+
+##external field z - direction
+
+external_heff = np.zeros(shape=np.shape(spin_map))
+external_heff[:, :, :, 0] = h * np.cos(h_theta) * np.sin(h_phi)
+external_heff[:, :, :, 1] = h * np.sin(h_theta) * np.sin(h_phi)
+external_heff[:, :, :, 2] = h * np.cos(h_phi)
+
+external_heff = tf.constant(external_heff, dtype=tf.float32)
+
+# heff = ex_heff + dm_heff + K_heff + DipS_heff + DipD_heff + external_heff
+heff = ex_heff + dm_heff + K_heff + external_heff
+
+'''temperature evolving'''
+def getTfeed(Tstart, Tend, Ann, total_iteration, it):
+    if it < Ann * total_iteration:
+        Tfeed = Tstart - (Tstart - Tend) * (it / (Ann * total_iteration))
+    else:
+        Tfeed = Tend
+    return Tfeed
+
+T = tf.placeholder(tf.float64)
+
+nextinput = IM.MCCanonical(T, heff)
+
+stepinput = tf.random_uniform([1, tf.shape(spin_map)[1], tf.shape(spin_map)[2], 1],
+                              minval=-0.5 + MixR / 2.,
+                              maxval=MixR / 2., dtype=tf.float32)
+stepfornext, stepforpreX = (tf.sign(stepinput) + 1.) / 2., (-tf.sign(stepinput) + 1.) / 2.
+
+new_spin_map = tf.nn.l2_normalize(spin_map * stepforpreX + nextinput * stepfornext, axis=-1)
+
+
+update_op = tf.assign(spin_map, new_spin_map)
+
+config = tf.ConfigProto()
+## True 이면 연산에 불필요하게 GPU를 모두 쓰는것이 아닌 필요한 부분만 쓰겠다는 뜻
+config.gpu_options.allow_growth = True
+
+for times in range(Nstart, Nend):
+    init = tf.global_variables_initializer()
+    sess = tf.Session(config=config)
+    sess.run(init)
+
+    currentDT2 = datetime.datetime.now()
+    print(times)
+
+
+    for iteration in range(total_iteration):
+        T_new = getTfeed(Tstart, Tend, Ann, total_iteration, iteration)
+        sess.run(update_op, feed_dict={T: T_new})
+
+        if (iteration+1) % sub_iteration == 0:
+            currentDT1 = datetime.datetime.now()
+            print("%d당 걸린시간: " % (sub_iteration), currentDT1 - currentDT2)
+            print("현재시간: ", currentDT1)
+            print("예상 남은시간: ", (currentDT1 - currentDT2) * (
+                        int((total_iteration - iteration) / sub_iteration) + 10 * (Nend - times - 1)))
+            print("Temperature", T_new)
+            print("simulating", (iteration+1) / total_iteration * 100, "%")
+            now_spin_map = sess.run(spin_map)
+            # figure = []
+            # number = []
+            #
+            # for i in range(batch_size):
+            #     rgb = getrgbvectormap(now_spin_map[i])
+            #     figure.append(rgb)
+            #     number.append(i)
+            # #             fig, rgb = plt.subplots(1, 1, figsize=(10, 10))
+            #
+            # number = tuple(number)
+            # #         fig, number = plt.subplots(1,10, figsize=(30, 10))
+            # fig, number = plt.subplots(1, batch_size, figsize=(50, 50))
+            # # for i in range(batch_size):
+            # #     number[i].imshow(figure[i])
+            # # plt.show()
+            # currentDT2 = datetime.datetime.now()
+            #
+            # # save_path = os.getcwd()
+            # figsizex = 9
+            # figsizey = 9
+            #
+            file_name = "DMN%0.2f" % DMN + "sample"
+
+    # for i in range(batch_size):
+    #     save_path = os.path.join(os.getcwd(), savefolder,
+    #                              file_name + "%d-" % (times) + "%d" % (i + 1) + "T" + "%1.4f" % (T_new))
+    #     '''너무 오래걸려서 그냥 끔;;'''
+    #     spinMapExcelSave(now_spin_map[i], paramdict, plotSaveDict, save_path)
+    #     colorimgSave(now_spin_map[i], save_path, figsizex, figsizey, interpolation="None")
+    # print(now_spin_map.shape)
+    np.save(os.path.join(os.getcwd(), savefolder, file_name+ "%d-" % (times) +"%d" % (batch_size) +"T" + "%1.4f" % (T_new)), now_spin_map)
+
+print('end')
+
+
